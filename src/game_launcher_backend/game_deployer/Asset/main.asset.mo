@@ -19,12 +19,21 @@ import Prim "mo:⛔";
 import State "State";
 import AssetStorage "AssetStorage";
 import SHA256 "../../utils/SHA256";
+import SHA256_ "../../utils/Sha256_";
+import B64 "../../utils/Base64";
+import Debug "mo:base/Debug";
+
+import CertTree "../../utils/CertTree";
+import CertifiedData "mo:base/CertifiedData";
 
 actor class Assets(owner : Principal) = this {
     private let BATCH_EXPIRY_NANOS = 300_000_000_000;
     stable var stableAuthorized : [Principal] = [owner];
     stable var stableAssets : [(AssetStorage.Key, State.StableAsset)] = [];
     private stable var _etags : Trie.Trie<Text, Text> = Trie.empty();
+
+    stable let cert_store : CertTree.Store = CertTree.newStore();
+    let ct = CertTree.Ops(cert_store);
 
     system func preupgrade() {
         stableAuthorized := state.authorized;
@@ -91,12 +100,14 @@ actor class Assets(owner : Principal) = this {
         switch (state.isAuthorized(caller)) {
             case (#err(e)) throw Error.reject(e);
             case (#ok()) {
+                // state.maintenanceMode := true;
                 _clear();
             };
         };
     };
 
     private func _clear() {
+        // ct. LIMPIEAR EL MERKLE TREE
         state := State.State(state.authorized, []);
         _etags := Trie.empty();
     };
@@ -287,6 +298,16 @@ actor class Assets(owner : Principal) = this {
         encodings.add("br");       //for brotli compressed files
         encodings.add("gzip");     //for gzip compressed files
 
+        // if (state.maintenanceMode) {
+        //     return {
+        //         status_code = 200;
+        //         headers = [ ("content-type", "text/html"), certification_header(r.url) ];
+        //         // headers = [ ("content-type", "text/html") ];
+        //         body = get("maintenanceBanner", ["identity"]);
+        //         streaming_strategy = null
+        //     }
+        // };
+
         // TODO: url decode + remove path.
         switch (Trie.find(state.assets, keyT(r.url), Text.equal)) {
             case (null) {};
@@ -306,6 +327,7 @@ actor class Assets(owner : Principal) = this {
                                 let headers = [
                                     ("Content-Type", asset.content_type),
                                     ("Content-Encoding", encoding_name),
+                                    certification_header(r.url)
                                 ];
                                 return {
                                     body = encoding.content_chunks[0];
@@ -324,6 +346,7 @@ actor class Assets(owner : Principal) = this {
                                     ("Content-Type", asset.content_type),
                                     ("Content-Encoding", encoding_name),
                                     ("ETag", etag),
+                                    certification_header(r.url)
                                 ];
                                 return {
                                     body = encoding.content_chunks[0];
@@ -342,6 +365,7 @@ actor class Assets(owner : Principal) = this {
                                     ("Content-Type", asset.content_type),
                                     ("Content-Encoding", encoding_name),
                                     ("ETag", etag),
+                                    certification_header(r.url)
                                 ];
                                 return {
                                     body = [];
@@ -359,6 +383,7 @@ actor class Assets(owner : Principal) = this {
                                 let headers = [
                                     ("Content-Type", asset.content_type),
                                     ("Content-Encoding", encoding_name),
+                                    certification_header(r.url)
                                 ];
                                 return {
                                     body = encoding.content_chunks[0];
@@ -510,6 +535,7 @@ actor class Assets(owner : Principal) = this {
             case (?a) return #ok(a);
         };
     };
+
     public query func getEncoding(n : Text) : async (Result.Result<State.AssetEncoding, Text>){
         switch (Trie.find(state.assets, keyT(n), Text.equal)) {
             case (null) {#err("asset not found")};
@@ -531,18 +557,29 @@ actor class Assets(owner : Principal) = this {
         switch (Trie.find(state.assets, keyT(a.key), Text.equal)) {
             case (null) #err("asset not found: " # a.key);
             case (?asset) {
+                // Debug.print("Es aqui obviamente");
+                // ct.put(
+                //     [
+                //         Text.encodeUtf8("http_assets"), 
+                //         Text.encodeUtf8(a.key)
+                //     ],
+                //     Text.encodeUtf8("hola")
+                // );
+                // Debug.print("No pasa de aqui obviamente");
                 var content_chunks : Buffer.Buffer<[Nat8]> = Buffer.Buffer<[Nat8]>(0);
                 for (chunkID in a.chunk_ids.vals()) {
                     switch (Trie.find(state.chunks, key(chunkID), Nat32.equal)) {
                         case (null) return #err("chunk not found: " # Nat32.toText(chunkID));
                         case (?chunk) {
                             content_chunks.add(chunk.content);
+                            state.chunks := Trie.remove(state.chunks, key(chunkID), Nat32.equal).0;
                         };
                     };
                 };
-                for (chunkID in a.chunk_ids.vals()) {
-                    state.chunks := Trie.remove(state.chunks, key(chunkID), Nat32.equal).0;
-                };
+                //TO TEST: This could be part of the previous for (?)
+                // for (chunkID in a.chunk_ids.vals()) {
+                //     state.chunks := Trie.remove(state.chunks, key(chunkID), Nat32.equal).0;
+                // };
                 var sha256 : [Nat8] = [];
                 var total_length = 0;
                 for (chunk in content_chunks.vals()) total_length += chunk.size();
@@ -569,6 +606,15 @@ actor class Assets(owner : Principal) = this {
                         encodings;
                     },
                 ).0;
+                ct.put(
+                    [
+                        "http_assets", 
+                        Text.encodeUtf8(a.key)
+                    ],
+                    Blob.fromArray(SHA256_.sha256(Array.flatten(content_chunks.toArray())))
+                );
+                ct.setCertifiedData();
+                //TO DO: Aqui es donde colocare el put al merkle tree...
                 #ok();
             };
         };
@@ -618,6 +664,29 @@ actor class Assets(owner : Principal) = this {
                 return "not found";
             };
         }
+    };
+
+    private func certification_header(url : Text) : (Text, Text) {
+        let witness = ct.reveal(["http_assets", Text.encodeUtf8(url)]);
+        let encoded = ct.encodeWitness(witness);
+        let cert = switch (CertifiedData.getCertificate()) {
+            case (?c) c;
+            case null {
+                // unfortunately, we cannot do
+                //   throw Error.reject("getCertificate failed. Call this as a query call!")
+                // here, because this function isn’t async, but we can’t make it async
+                // because it is called from a query (and it would do the wrong thing) :-(
+                //
+                // So just return erronous data instead
+                "getCertificate failed. Call this as a query call!" : Blob
+            }
+        };
+        return
+        (
+            "ic-certificate",
+            "certificate=:" # B64.base64(cert) # ":, " #
+            "tree=:" # B64.base64(encoded) # ":"
+        )
     };
 
 };
